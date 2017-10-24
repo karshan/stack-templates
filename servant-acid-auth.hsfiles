@@ -17,12 +17,14 @@ library
   build-depends:       base >= 4.7 && < 5
                      , acid-state
                      , aeson
+                     , clientsession
                      , lens
                      , natural-transformation
                      , protolude
                      , safecopy
                      , servant-server
                      , wai
+                     , wai-middleware-auth
                      , warp
   default-language:    Haskell2010
 
@@ -34,82 +36,68 @@ executable {{name}}-exe
                      , {{name}}
   default-language:    Haskell2010
 
-test-suite {{name}}-test
-  type:                exitcode-stdio-1.0
-  hs-source-dirs:      test
-  main-is:             Spec.hs
-  build-depends:       base
-                     , {{name}}
-                     , directory
-                     , hspec
-                     , hspec-wai
-                     , hspec-wai-json
-                     , aeson
-  ghc-options:         -threaded -rtsopts -with-rtsopts=-N
-  default-language:    Haskell2010
-
 {-# START_FILE Setup.hs #-}
 import Distribution.Simple
 main = defaultMain
 
-{-# START_FILE test/Spec.hs #-}
-{-# LANGUAGE OverloadedStrings   #-}
-{-# LANGUAGE QuasiQuotes         #-}
-{-# LANGUAGE ScopedTypeVariables #-}
-module Main (main) where
-
-import           API                 (app)
-import           Control.Exception   (catch)
-import           Data.String
-import           DB                  (openDB)
-import           System.Directory    (removeDirectoryRecursive)
-import           System.IO.Error     (IOError)
-import           Test.Hspec
-import           Test.Hspec.Wai
-import           Test.Hspec.Wai.JSON
-
-main :: IO ()
-main = hspec spec
-
-setup = do
-    removeDirectoryRecursive "test.db" `catch` (\(_ :: IOError) -> return ())
-    app <$> openDB "test.db"
-
-einstein :: String
-einstein = "{\"userId\":1,\"userFirstName\":\"Albert\",\"userLastName\":\"Einstein\"}"
-
-spec :: Spec
-spec = beforeAll setup $ do
-    describe "GET /users" $ do
-        it "responds with 200" $ do
-            get "/users" `shouldRespondWith` 200
-        it "responds with [User]" $ do
-            let users = "[]"
-            get "/users" `shouldRespondWith` (fromString users)
-    describe "POST /add" $ do
-        it "responds with 200" $ do
-            request "POST" "/add" [("Content-Type", "application/json")] (fromString einstein) `shouldRespondWith` 200
-        it "added einstein" $ do
-            get "/users" `shouldRespondWith` (fromString ("[" ++ einstein ++ "]"))
-           
 {-# START_FILE src/Lib.hs #-}
 {-# LANGUAGE NoImplicitPrelude #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE RecordWildCards   #-}
 module Lib
     ( startApp
+    , defaultAppConfig
     ) where
 
-import           API                      (app)
-import           DB                       (DBHandle, openDB)
-import           Network.Wai              (Application)
-import           Network.Wai.Handler.Warp (run)
+import           API                                       (app)
+import           DB                                        (DBHandle, openDB)
+import           Network.Wai                               (Application)
+import           Network.Wai.Handler.Warp                  (HostPreference,
+                                                            defaultSettings,
+                                                            runSettings,
+                                                            setHost, setPort)
+import           Network.Wai.Middleware.Auth               (defaultAuthSettings,
+                                                            mkAuthMiddleware,
+                                                            setAuthAppRootStatic,
+                                                            setAuthKey,
+                                                            setAuthProviders)
+import           Network.Wai.Middleware.Auth.OAuth2.Google (googleParser)
+import           Network.Wai.Middleware.Auth.Provider      (parseProviders)
 import           Protolude
-import           Servant                  (Handler, serve)
+import           Servant                                   (Handler, serve)
+import           Web.ClientSession                         (randomKey)
 
-startApp :: FilePath -> IO ()
-startApp dbFilePath = do
-    acid <- openDB dbFilePath
-    run 8080 (app acid)
+data AppConfig =
+    AppConfig {
+        dbDir     :: FilePath
+      , staticDir :: FilePath
+      , authFile  :: FilePath
+      , baseUrl   :: Text
+      , host      :: HostPreference
+      , port      :: Int
+    } deriving (Eq, Show)
+
+defaultAppConfig :: AppConfig
+defaultAppConfig = AppConfig "db" "static" "auth.json" "localhost:8080" "127.0.0.1" 8080
+
+startApp :: AppConfig -> IO ()
+startApp AppConfig{..} = do
+    acid <- openDB dbDir
+    flip parseProviders [googleParser] <$> readFile authFile >>=
+        either
+            (\e -> putText $ "Failed to parse " <> toS authFile <> ": " <> e)
+            (\providers -> do
+                authMiddleware <- mkAuthMiddleware $
+                    (defaultAuthSettings &
+                        setAuthKey (snd <$> randomKey) &
+                        setAuthAppRootStatic baseUrl &
+                        setAuthProviders providers)
+                putText $ "Listening on " <> show host <> ":" <> show port <> " (" <> baseUrl <> ")"
+                runSettings
+                    (defaultSettings &
+                        setPort port &
+                        setHost host)
+                    (authMiddleware $ app acid staticDir))
 
 {-# START_FILE src/API.hs #-}
 {-# LANGUAGE DataKinds         #-}
@@ -128,7 +116,9 @@ import           Types     (User)
 type API = "users" :> Get '[JSON] [User]
       :<|> "add"   :> ReqBody '[JSON] User :> Post '[JSON] ()
 
-api :: Proxy API
+type StaticAPI = API :<|> "static" :> Raw
+
+api :: Proxy StaticAPI
 api = Proxy
 
 server :: DBHandle -> Server API
@@ -137,8 +127,8 @@ server acid = enter (runReaderTNat acid :: DBHandler :~> Handler) readerServerT
 readerServerT :: ServerT API DBHandler
 readerServerT = getUsers :<|> addUser
 
-app :: DBHandle -> Application
-app acid = serve api (server acid)
+app :: DBHandle -> FilePath -> Application
+app acid staticDir = serve api (server acid :<|> serveDirectoryFileServer staticDir)
 
 {-# START_FILE src/DB.hs #-}
 {-# LANGUAGE NoImplicitPrelude #-}
