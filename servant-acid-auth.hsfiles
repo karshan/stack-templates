@@ -204,7 +204,7 @@ module Main where
 import Lib
 
 main :: IO ()
-main = startApp "main.db"
+main = startApp defaultAppConfig
 
 {-# START_FILE README.md #-}
 # {{name}}
